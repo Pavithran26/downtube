@@ -1,92 +1,150 @@
-import os
-import uuid
 import glob
+import ipaddress
 import json
+import os
+import re
+import shutil
+import socket
 import subprocess
 import threading
-from flask import Flask, request, jsonify, send_file, render_template
+import time
+import uuid
+from collections import defaultdict, deque
+from pathlib import Path
+from urllib.parse import urlparse
+
+from flask import Flask, abort, jsonify, render_template, request, send_file
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", BASE_DIR / "downloads"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+JOB_TTL = int(os.environ.get("JOB_TTL_SECONDS", "1800"))
+MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", str(1024 ** 3)))
+MAX_PLAYLIST_ITEMS = 10
+MAX_ACTIVE_DOWNLOADS = 1
+DOWNLOAD_TIMEOUT = 1800
+JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
 app = Flask(__name__)
-DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 jobs = {}
+jobs_lock = threading.RLock()
+rate_lock = threading.Lock()
+rate_buckets = defaultdict(deque)
+
+
+def client_ip():
+    return request.remote_addr or "unknown"
+
+
+def rate_limit(bucket, limit, window):
+    now = time.time()
+    key = (client_ip(), bucket)
+    with rate_lock:
+        history = rate_buckets[key]
+        while history and now - history[0] > window:
+            history.popleft()
+        if len(history) >= limit:
+            return False
+        history.append(now)
+        return True
+
+
+def cleanup_expired():
+    cutoff = time.time() - JOB_TTL
+    try:
+        for path in DOWNLOAD_DIR.iterdir():
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+    with jobs_lock:
+        for job_id, job in list(jobs.items()):
+            if job.get("created", 0) < cutoff and job.get("status") != "downloading":
+                jobs.pop(job_id, None)
+
+
+def validate_public_url(value):
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ValueError("Enter a valid URL (maximum 2048 characters).")
+
+    value = value.strip()
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only public HTTP and HTTPS URLs are supported.")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing embedded credentials are not allowed.")
+
+    host = parsed.hostname.rstrip(".").lower()
+    if host in {"localhost", "metadata.google.internal"} or host.endswith((".localhost", ".local", ".internal", ".test")):
+        raise ValueError("Private or local network addresses are not allowed.")
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+        resolved = {literal_ip}
+    except ValueError:
+        try:
+            results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            resolved = {ipaddress.ip_address(item[4][0].split("%")[0]) for item in results}
+        except (OSError, ValueError):
+            raise ValueError("The URL host could not be resolved.")
+
+    if not resolved or any(not address.is_global for address in resolved):
+        raise ValueError("Private, local, and reserved network addresses are not allowed.")
+
+    return value
+
+
+def request_data():
+    if not request.is_json:
+        return None, (jsonify({"error": "Send JSON content."}), 415)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None, (jsonify({"error": "Invalid JSON request."}), 400)
+    return data, None
 
 
 def parse_ytdlp_json(stdout):
-    """Parse yt-dlp JSON output.
-
-    With ``-j`` yt-dlp prints one JSON object per line. Some extractors
-    emit multiple videos even with ``--no-playlist``, so stdout contains
-    several objects and a plain ``json.loads`` raises "Extra data".
-    Return the first valid object.
-    """
     for line in stdout.splitlines():
         line = line.strip()
-        if not line:
-            continue
-        return json.loads(line)
-    raise ValueError("yt-dlp returned no data")
+        if line:
+            return json.loads(line)
+    raise ValueError("The media source returned no information.")
 
 
-def run_download(job_id, url, format_choice, format_id):
-    job = jobs[job_id]
-    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+def active_download_count():
+    return sum(1 for job in jobs.values() if job.get("status") == "downloading")
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
 
-    if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
-    elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
-    else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+@app.before_request
+def request_guards():
+    cleanup_expired()
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        origin = request.headers.get("Origin")
+        if origin and urlparse(origin).netloc.lower() != request.host.lower():
+            abort(403)
 
-    cmd.append(url)
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
-            return
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
-        if not files:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
-            return
 
-        if format_choice == "audio":
-            target = [f for f in files if f.endswith(".mp3")]
-            chosen = target[0] if target else files[0]
-        else:
-            target = [f for f in files if f.endswith(".mp4")]
-            chosen = target[0] if target else files[0]
-
-        for f in files:
-            if f != chosen:
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-
-        job["status"] = "done"
-        job["file"] = chosen
-        ext = os.path.splitext(chosen)[1]
-        title = job.get("title", "").strip()
-        # Sanitize title for filename
-        if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
-        else:
-            job["filename"] = os.path.basename(chosen)
-    except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
+@app.route("/healthz")
+def health():
+    return jsonify({"status": "ok"})
 
 
 @app.route("/")
@@ -96,115 +154,213 @@ def index():
 
 @app.route("/api/info", methods=["POST"])
 def get_info():
-    data = request.json
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
+    if not rate_limit("info", 20, 60):
+        return jsonify({"error": "Too many requests. Please wait a minute."}), 429
+    data, error = request_data()
+    if error:
+        return error
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        url = validate_public_url(data.get("url", ""))
+        command = ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "20", "-j", url]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
         if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
+            lines = result.stderr.strip().splitlines()
+            return jsonify({"error": lines[-1][-240:] if lines else "Could not read this media URL."}), 400
 
         info = parse_ytdlp_json(result.stdout)
-
-        # Build quality options — keep best format per resolution
         best_by_height = {}
-        for f in info.get("formats", []):
-            height = f.get("height")
-            if height and f.get("vcodec", "none") != "none":
-                tbr = f.get("tbr") or 0
-                if height not in best_by_height or tbr > (best_by_height[height].get("tbr") or 0):
-                    best_by_height[height] = f
+        for item in info.get("formats", []):
+            height = item.get("height")
+            if height and item.get("vcodec", "none") != "none":
+                bitrate = item.get("tbr") or 0
+                if height not in best_by_height or bitrate > (best_by_height[height].get("tbr") or 0):
+                    best_by_height[height] = item
 
-        formats = []
-        for height, f in best_by_height.items():
-            formats.append({
-                "id": f["format_id"],
-                "label": f"{height}p",
-                "height": height,
-            })
-        formats.sort(key=lambda x: x["height"], reverse=True)
+        formats = [
+            {"id": item["format_id"], "label": str(height) + "p", "height": height}
+            for height, item in best_by_height.items()
+            if item.get("format_id") and re.fullmatch(r"[A-Za-z0-9_.+-]{1,80}", str(item["format_id"]))
+        ]
+        formats.sort(key=lambda item: item["height"], reverse=True)
+
+        thumbnail = info.get("thumbnail") or ""
+        if not isinstance(thumbnail, str) or not thumbnail.startswith(("https://", "http://")):
+            thumbnail = ""
 
         return jsonify({
-            "title": info.get("title", ""),
-            "thumbnail": info.get("thumbnail", ""),
+            "title": str(info.get("title") or "")[:300],
+            "thumbnail": thumbnail,
             "duration": info.get("duration"),
-            "uploader": info.get("uploader", ""),
-            "formats": formats,
+            "uploader": str(info.get("uploader") or "")[:120],
+            "formats": formats[:12],
         })
     except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching video info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": "The information request timed out. Try again."}), 408
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        app.logger.exception("Media information lookup failed")
+        return jsonify({"error": "Unable to inspect this media URL."}), 500
 
 
 @app.route("/api/playlist", methods=["POST"])
 def get_playlist_info():
-    data = request.json
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    cmd = ["yt-dlp", "--flat-playlist", "-J", url]
+    if not rate_limit("playlist", 5, 60):
+        return jsonify({"error": "Too many playlist requests. Please wait a minute."}), 429
+    data, error = request_data()
+    if error:
+        return error
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        url = validate_public_url(data.get("url", ""))
+        command = [
+            "yt-dlp", "--flat-playlist", "--playlist-end", str(MAX_PLAYLIST_ITEMS),
+            "--no-warnings", "--socket-timeout", "20", "-J", url
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
         if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
+            lines = result.stderr.strip().splitlines()
+            return jsonify({"error": lines[-1][-240:] if lines else "Could not read this playlist."}), 400
         info = json.loads(result.stdout)
-        entries = info.get("entries", [])
-        urls = [entry.get("url") for entry in entries if entry.get("url")]
-        return jsonify({"urls": urls})
+        urls = []
+        for entry in (info.get("entries") or [])[:MAX_PLAYLIST_ITEMS]:
+            candidate = entry.get("webpage_url") or entry.get("original_url")
+            if candidate:
+                try:
+                    urls.append(validate_public_url(candidate))
+                except ValueError:
+                    continue
+        return jsonify({"urls": urls, "truncated": len(info.get("entries") or []) >= MAX_PLAYLIST_ITEMS})
     except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching playlist info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": "The playlist lookup timed out."}), 408
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        app.logger.exception("Playlist lookup failed")
+        return jsonify({"error": "Unable to inspect this playlist."}), 500
+
+
+def run_download(job_id, url, format_choice, format_id, title):
+    output_template = str(DOWNLOAD_DIR / (job_id + ".%(ext)s"))
+    command = [
+        "yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "20",
+        "--retries", "2", "--max-filesize", "1G", "--no-overwrites",
+        "-o", output_template,
+    ]
+    if format_choice == "audio":
+        command += ["-x", "--audio-format", "mp3", "--audio-quality", "5"]
+    elif format_id:
+        command += ["-f", format_id + "+bestaudio/best", "--merge-output-format", "mp4"]
+    else:
+        command += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+    command.append(url)
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT, check=False)
+        if result.returncode != 0:
+            lines = result.stderr.strip().splitlines()
+            with jobs_lock:
+                jobs[job_id].update(status="error", error=(lines[-1][-240:] if lines else "Download failed."))
+            return
+
+        files = [Path(name) for name in glob.glob(str(DOWNLOAD_DIR / (job_id + ".*"))) if Path(name).is_file()]
+        if not files:
+            with jobs_lock:
+                jobs[job_id].update(status="error", error="Download finished but no output file was found.")
+            return
+
+        preferred_ext = ".mp3" if format_choice == "audio" else ".mp4"
+        chosen = next((path for path in files if path.suffix.lower() == preferred_ext), files[0])
+        for path in files:
+            if path != chosen:
+                path.unlink(missing_ok=True)
+
+        safe_title = "".join(ch for ch in (title or "") if ch not in r'\/:*?"<>|')[:100].strip()
+        filename = safe_title + chosen.suffix if safe_title else chosen.name
+        with jobs_lock:
+            jobs[job_id].update(status="done", file=str(chosen), filename=filename)
+    except subprocess.TimeoutExpired:
+        for path in DOWNLOAD_DIR.glob(job_id + ".*"):
+            path.unlink(missing_ok=True)
+        with jobs_lock:
+            jobs[job_id].update(status="error", error="Download timed out (30-minute limit).")
+    except Exception:
+        app.logger.exception("Download job failed")
+        with jobs_lock:
+            jobs[job_id].update(status="error", error="Download failed unexpectedly.")
 
 
 @app.route("/api/download", methods=["POST"])
 def start_download():
-    data = request.json
-    url = data.get("url", "").strip()
-    format_choice = data.get("format", "video")
-    format_id = data.get("format_id")
-    title = data.get("title", "")
+    if not rate_limit("download", 5, 3600):
+        return jsonify({"error": "Download limit reached. Try again later."}), 429
+    data, error = request_data()
+    if error:
+        return error
+    try:
+        url = validate_public_url(data.get("url", ""))
+        format_choice = data.get("format", "video")
+        if format_choice not in ("video", "audio"):
+            return jsonify({"error": "Choose MP4 video or MP3 audio."}), 400
+        format_id = data.get("format_id")
+        if format_id and (not isinstance(format_id, str) or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,80}", format_id)):
+            return jsonify({"error": "Invalid quality selection."}), 400
 
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
+        if shutil.disk_usage(DOWNLOAD_DIR).free < 2 * 1024 ** 3:
+            return jsonify({"error": "Server storage is low. Try again later."}), 507
 
-    job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
-
-    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({"job_id": job_id})
+        with jobs_lock:
+            if active_download_count() >= MAX_ACTIVE_DOWNLOADS:
+                return jsonify({"error": "One download is already running. Please wait until it finishes."}), 429
+            job_id = uuid.uuid4().hex[:12]
+            jobs[job_id] = {
+                "status": "downloading", "url": url, "title": str(data.get("title") or "")[:300],
+                "created": time.time(),
+            }
+        worker = threading.Thread(
+            target=run_download,
+            args=(job_id, url, format_choice, format_id, str(data.get("title") or "")),
+            daemon=True,
+        )
+        worker.start()
+        return jsonify({"job_id": job_id})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/status/<job_id>")
 def check_status(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "status": job["status"],
-        "error": job.get("error"),
-        "filename": job.get("filename"),
-    })
+    if not JOB_ID_RE.fullmatch(job_id):
+        return jsonify({"error": "Invalid job ID."}), 400
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found or expired."}), 404
+        return jsonify({
+            "status": job["status"],
+            "error": job.get("error"),
+            "filename": job.get("filename"),
+            "expires_in_seconds": max(0, JOB_TTL - int(time.time() - job.get("created", time.time()))),
+        })
 
 
 @app.route("/api/file/<job_id>")
 def download_file(job_id):
-    job = jobs.get(job_id)
-    if not job or job["status"] != "done":
-        return jsonify({"error": "File not ready"}), 404
-    return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+    if not JOB_ID_RE.fullmatch(job_id):
+        return jsonify({"error": "Invalid job ID."}), 400
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job or job.get("status") != "done":
+            return jsonify({"error": "File not ready or expired."}), 404
+        file_path = Path(job.get("file", "")).resolve()
+        if file_path.parent != DOWNLOAD_DIR.resolve() or not file_path.is_file():
+            return jsonify({"error": "Download file is no longer available."}), 404
+        return send_file(
+            file_path, as_attachment=True,
+            download_name=job.get("filename", file_path.name),
+            conditional=True,
+        )
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8899))
-    host = os.environ.get("HOST", "127.0.0.1")
-    app.run(host=host, port=port)
+    port = int(os.environ.get("PORT", "8899"))
+    app.run(host=os.environ.get("HOST", "127.0.0.1"), port=port)
