@@ -16,7 +16,8 @@ A self-hosted media workspace built with Flask, yt-dlp, and FFmpeg. The included
 ## Stack
 
 - Python 3.12, Flask, Gunicorn
-- yt-dlp for supported public media sources
+- yt-dlp with its default EJS components for YouTube support
+- Deno JavaScript runtime for YouTube challenge solving
 - FFmpeg for merging and audio extraction
 - Nginx reverse proxy and HTTPS
 - Ubuntu 24.04 LTS
@@ -28,6 +29,7 @@ On Ubuntu:
 \`\`\`bash
 sudo apt update
 sudo apt install -y python3-venv ffmpeg
+curl -fsSL https://deno.land/install.sh | sh
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
